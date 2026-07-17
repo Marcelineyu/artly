@@ -1,0 +1,17 @@
+# Normalize text files to LF in the repository.
+* text=auto eol=lf
+
+# Source files (kept explicit so line-ending handling is unambiguous).
+*.html   text
+*.css    text
+*.js     text
+*.py     text
+*.json   text
+*.md     text
+
+# Binary assets should never be diffed or line-ending converted.
+*.webp   binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.mp3    binary
