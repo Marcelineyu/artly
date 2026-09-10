@@ -71,6 +71,13 @@ let uploadedBase64 = null;
 let uploadedMime = 'image/jpeg';
 let cameraStream = null;
 
+const ALLOWED_UPLOAD_MIME_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp'
+]);
+const MAX_UPLOAD_BASE64_LENGTH = 4_000_000;
+
 const gallery = document.getElementById('gallery');
 const styleSection = document.getElementById('styleSection');
 const uploadSection = document.getElementById('uploadSection');
@@ -164,14 +171,39 @@ uploadBtn.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
   const file = fileInput.files[0];
   if (!file) return;
-  uploadedMime = file.type || 'image/jpeg';
+
   const reader = new FileReader();
   reader.onload = e => {
-    const dataUrl = e.target.result;
-    uploadedBase64 = dataUrl.split(',')[1];
+    const dataUrl = String(e.target.result || '');
+    const match = dataUrl.match(/^data:(image\/(?:jpeg|png|webp));base64,(.+)$/s);
+
+    if (!match || !ALLOWED_UPLOAD_MIME_TYPES.has(match[1])) {
+      uploadedBase64 = null;
+      setStatus('Please use a JPG, PNG, or WebP image.', true);
+      updateGenerateState();
+      return;
+    }
+
+    if (match[2].length > MAX_UPLOAD_BASE64_LENGTH) {
+      uploadedBase64 = null;
+      setStatus('This photo is too large. Please choose an image under 3 MB.', true);
+      updateGenerateState();
+      return;
+    }
+
+    // Read both values from the same data URL so the MIME type always
+    // describes the exact base64 payload sent to the API.
+    uploadedMime = match[1];
+    uploadedBase64 = match[2];
     previewImg.src = dataUrl;
     previewFrame.classList.add('show');
     retakeRow.classList.remove('show');
+    setStatus('');
+    updateGenerateState();
+  };
+  reader.onerror = () => {
+    uploadedBase64 = null;
+    setStatus('This image could not be read. Please choose another one.', true);
     updateGenerateState();
   };
   reader.readAsDataURL(file);
@@ -199,10 +231,19 @@ function closeCamera(){
 
 captureBtn.addEventListener('click', () => {
   const canvas = document.createElement('canvas');
-  canvas.width = cameraVideo.videoWidth;
-  canvas.height = cameraVideo.videoHeight;
+  const maxDimension = 2048;
+  const scale = Math.min(1, maxDimension / cameraVideo.videoWidth, maxDimension / cameraVideo.videoHeight);
+  canvas.width = Math.round(cameraVideo.videoWidth * scale);
+  canvas.height = Math.round(cameraVideo.videoHeight * scale);
   canvas.getContext('2d').drawImage(cameraVideo, 0, 0);
   const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+
+  if (dataUrl.split(',')[1].length > MAX_UPLOAD_BASE64_LENGTH) {
+    closeCamera();
+    setStatus('This photo is too large. Please try again or upload a smaller image.', true);
+    return;
+  }
+
   uploadedMime = 'image/jpeg';
   uploadedBase64 = dataUrl.split(',')[1];
   previewImg.src = dataUrl;
@@ -236,6 +277,16 @@ function setStatus(msg, isError){
 generateBtn.addEventListener('click', async () => {
   if (!selectedStyle || !uploadedBase64) return;
 
+  // Freeze the chosen style and photo for this request. The gallery remains
+  // interactive while Gemini is working, so mutable UI state must not relabel
+  // a response that belongs to an earlier selection.
+  const requestStyle = selectedStyle;
+  const requestPayload = {
+    styleId: requestStyle.id,
+    imageBase64: uploadedBase64,
+    mimeType: uploadedMime
+  };
+
   scrollToSection(resultAnchor);
 
   generateBtn.disabled = true;
@@ -246,12 +297,11 @@ generateBtn.addEventListener('click', async () => {
   try {
     const resp = await fetch('/api/generate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        styleId: selectedStyle.id,
-        imageBase64: uploadedBase64,
-        mimeType: uploadedMime
-      })
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(requestPayload)
     });
 
     let data;
@@ -262,31 +312,37 @@ generateBtn.addEventListener('click', async () => {
     }
 
     if (!resp.ok) {
-      throw new Error(data.error || `Request failed (${resp.status})`);
+      const requestId = data?.debug?.requestId || resp.headers.get('x-artly-request-id');
+      const reference = requestId ? ` Reference: ${requestId}.` : '';
+      throw new Error((data.error || `Request failed (${resp.status}).`) + reference);
     }
 
-    if (!data.image) {
+    if (!data.image || typeof data.image !== 'string') {
       throw new Error('No image returned — try a different photo or style.');
+    }
+
+    if (data.debug?.styleId && data.debug.styleId !== requestStyle.id) {
+      throw new Error('The server returned a result for a different style. Please try again.');
     }
 
     const mime = data.mimeType || 'image/png';
     const b64 = data.image;
 
     resultImg.src = `data:${mime};base64,${b64}`;
-    resultStyleName.textContent = selectedStyle.name;
+    resultStyleName.textContent = requestStyle.name;
     resultEl.classList.add('show');
     resultEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
     setStatus('Your image is ready.');
     downloadBtn.onclick = () => {
       const a = document.createElement('a');
       a.href = resultImg.src;
-      a.download = `artly-${selectedStyle.id}.png`;
+      a.download = `artly-${requestStyle.id}.${mime === 'image/jpeg' ? 'jpg' : mime.split('/')[1] || 'png'}`;
       a.click();
     };
   } catch (err) {
     setStatus(err.message, true);
   } finally {
-    generateBtn.disabled = false;
+    updateGenerateState();
   }
 });
 

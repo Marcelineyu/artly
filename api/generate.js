@@ -1,3 +1,5 @@
+const { randomUUID } = require('node:crypto');
+
 const STYLE_PROMPTS = {
   "mspaint": "Redraw the attached image in the most clumsy, scribbly, and utterly pathetic way possible. Use the same color palette, and make it look like it was drawn in MS Paint with a mouse. It should be vaguely similar but also not really, kind of matching but also off in a confusing, awkward way, with that low-quality pixel-by-pixel feel that really emphasizes how ridiculously bad it is.",
   "storybook": "Transform the uploaded photo into a charming cute storybook illustration. Preserve the original composition, camera angle, perspective, lighting direction, pose, facial expressions, and all recognizable people and important objects. Redraw the entire scene as a playful hand-drawn 2D illustration while keeping everyone easily recognizable. Simplify the whole image into soft rounded shapes with a clean, childlike aesthetic. Characters should have slightly oversized heads, simple dot eyes, tiny rounded nose, small smiling mouth, rosy cheeks, soft rounded face, minimal facial features, natural body proportions, slightly simplified hairstyles while preserving the original hairstyle and hair color, and recognizable clothing colors and silhouettes. Keep the personalities and relationships between people unchanged. Replace realistic textures with smooth hand-painted flat color blocks. Use soft, slightly uneven hand-drawn outlines instead of perfect vector lines. Brush strokes should feel natural and handcrafted. Keep shading extremely simple with only soft color transitions. Avoid realistic rendering. The background should be simplified into clean geometric shapes while preserving the recognizable environment. Large objects such as buildings, trees, furniture, streets, vehicles, windows, doors, plants, and clouds should become simplified illustrated forms with rounded edges. Place the subjects on a clean white or very light neutral background with generous negative space. Around the characters, add playful childlike doodle decorations inspired by the original scene, such as a smiling sun, fluffy clouds, colorful stars, little hearts, flowers, leaves, sparkles, tiny trees, little houses, simple cars, and birds. Decorations should feel spontaneous and hand drawn, like a child joyfully doodled around a favorite photo. Do not cover the faces or important subjects, and keep the doodles balanced around the composition. Use a bright cheerful color palette of ivory white, cream, sky blue, cobalt blue, turquoise, coral pink, cherry blossom pink, peach, lemon yellow, sunflower yellow, warm orange, apple green, sage green, emerald green, lavender, and warm brown. Increase brightness slightly and keep colors vibrant but harmonious. Lighting should feel soft, sunny, optimistic, and full of warmth. The final illustration should resemble a modern children's picture book combined with a playful sticker sheet: cute, happy, playful, cozy, innocent, bright, warm, joyful, gentle, minimal, handmade, whimsical, friendly. No photorealism, no anime, no manga, no 3D rendering, no realistic painting, no glossy effects, no heavy shadows, no dramatic lighting, no realistic skin texture, no excessive detail, no text, no watermark, no logos, no signatures.",
@@ -13,6 +15,15 @@ const STYLE_PROMPTS = {
   "editorial": "Transform the image into a warm, modern editorial flat illustration while faithfully preserving the original composition and important objects. Use clean geometric shapes, simplified forms, and hand-painted digital brush textures instead of realistic rendering. Create soft irregular edges with subtle painterly imperfections rather than crisp vector graphics. Apply visible gouache and dry-brush textures throughout every object. Use bold but harmonious color blocking with slightly muted saturation. Keep lighting minimal and stylized, avoiding realistic shadows. Add subtle grain, paper texture, and brushstroke variation to create a handcrafted digital illustration feel. Simplify every object into large graphic color shapes while preserving recognizable silhouettes. Use modern editorial illustration aesthetics inspired by lifestyle magazines and contemporary children's books. Maintain balanced composition, generous negative space, and clean visual hierarchy. Avoid realism. Avoid 3D rendering. Avoid anime. Avoid glossy materials. Avoid photorealistic textures. Ultra detailed. High resolution."
 };
 
+const GEMINI_MODEL = 'gemini-3.1-flash-image';
+const MAX_BASE64_LENGTH = 4_000_000;
+const EDIT_INSTRUCTION = [
+  'Edit the supplied image into a new, visibly transformed image.',
+  'Use the supplied image as the subject and composition reference, and apply the selected style instructions strongly across the result.',
+  'Do not return the input image unchanged or merely describe the edit.',
+  'Return the finished edited image.'
+].join(' ');
+
 const ALLOWED_MIME_TYPES = new Set([
   'image/jpeg',
   'image/png',
@@ -26,41 +37,87 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
+function getInlineImage(part) {
+  const inline = part?.inlineData || part?.inline_data;
+  const data = inline?.data;
+  const mimeType = inline?.mimeType || inline?.mime_type;
+
+  if (part?.thought === true || typeof data !== 'string' || !mimeType?.startsWith('image/')) {
+    return null;
+  }
+
+  return { data, mimeType };
+}
+
+function isValidBase64(value) {
+  if (!value || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    return false;
+  }
+
+  try {
+    return Buffer.from(value, 'base64').toString('base64') === value;
+  } catch (error) {
+    return false;
+  }
+}
+
 module.exports = async function handler(req, res) {
+  const requestId = randomUUID().replaceAll('-', '').slice(0, 12);
+  res.setHeader('X-Artly-Request-Id', requestId);
+
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
-    return sendJson(res, 405, { error: 'Method not allowed.' });
+    return sendJson(res, 405, { error: 'Method not allowed.', debug: { requestId } });
   }
 
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
     const { styleId, imageBase64, mimeType } = body;
+    const normalizedStyleId = typeof styleId === 'string' ? styleId.trim() : '';
+    const normalizedMimeType = typeof mimeType === 'string' ? mimeType.toLowerCase().trim() : '';
+    const normalizedImage = typeof imageBase64 === 'string' ? imageBase64.replace(/\s/g, '') : '';
+    const debug = {
+      requestId,
+      styleId: normalizedStyleId || null,
+      model: GEMINI_MODEL,
+      inputMimeType: normalizedMimeType || null
+    };
 
-    if (!styleId || !STYLE_PROMPTS[styleId]) {
-      return sendJson(res, 400, { error: 'Please choose a valid Artly style.' });
+    if (!normalizedStyleId || !STYLE_PROMPTS[normalizedStyleId]) {
+      return sendJson(res, 400, { error: 'Please choose a valid Artly style.', debug });
     }
 
-    if (!imageBase64 || typeof imageBase64 !== 'string') {
-      return sendJson(res, 400, { error: 'Please upload or take a photo first.' });
+    if (!normalizedImage) {
+      return sendJson(res, 400, { error: 'Please upload or take a photo first.', debug });
     }
 
-    if (!ALLOWED_MIME_TYPES.has(mimeType)) {
-      return sendJson(res, 415, { error: 'Please use a JPG, PNG, or WebP image.' });
+    if (!ALLOWED_MIME_TYPES.has(normalizedMimeType)) {
+      return sendJson(res, 415, { error: 'Please use a JPG, PNG, or WebP image.', debug });
     }
 
-    // Base64 is larger than the original binary. This keeps requests manageable.
-    if (imageBase64.length > 10_000_000) {
-      return sendJson(res, 413, { error: 'This photo is too large. Please choose a smaller image.' });
+    // Keep the JSON request below Vercel's 4.5 MB function body limit.
+    if (normalizedImage.length > MAX_BASE64_LENGTH) {
+      return sendJson(res, 413, { error: 'This photo is too large. Please choose an image under 3 MB.', debug });
     }
+
+    if (!isValidBase64(normalizedImage)) {
+      return sendJson(res, 400, { error: 'The uploaded image data is invalid. Please choose the photo again.', debug });
+    }
+
+    const inputBytes = Buffer.from(normalizedImage, 'base64').length;
+    const prompt = `${EDIT_INSTRUCTION}\n\nSelected style instructions:\n${STYLE_PROMPTS[normalizedStyleId]}`;
+    debug.inputBytes = inputBytes;
+    debug.promptChars = prompt.length;
 
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      console.error('Missing GEMINI_API_KEY environment variable.');
-      return sendJson(res, 500, { error: 'The image service is not configured yet.' });
+      console.error('Artly configuration error.', { requestId, reason: 'missing_api_key' });
+      return sendJson(res, 500, { error: 'The image service is not configured yet.', debug });
     }
 
-    const model = 'gemini-2.5-flash-image';
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    const endpoint = `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`;
+
+    console.info('Artly generation started.', debug);
 
     const geminiResponse = await fetch(endpoint, {
       method: 'POST',
@@ -68,14 +125,16 @@ module.exports = async function handler(req, res) {
         'Content-Type': 'application/json',
         'x-goog-api-key': apiKey
       },
+      signal: AbortSignal.timeout(55_000),
       body: JSON.stringify({
         contents: [{
+          role: 'user',
           parts: [
-            { text: STYLE_PROMPTS[styleId] },
+            { text: prompt },
             {
               inline_data: {
-                mime_type: mimeType,
-                data: imageBase64
+                mime_type: normalizedMimeType,
+                data: normalizedImage
               }
             }
           ]
@@ -87,25 +146,61 @@ module.exports = async function handler(req, res) {
     const data = await geminiResponse.json();
 
     if (!geminiResponse.ok) {
-      const serverMessage = data?.error?.message || `Gemini request failed (${geminiResponse.status}).`;
-      console.error('Gemini API error:', serverMessage);
-      return sendJson(res, geminiResponse.status, { error: serverMessage });
+      console.error('Gemini API error.', {
+        requestId,
+        httpStatus: geminiResponse.status,
+        errorCode: data?.error?.status || data?.error?.code || null
+      });
+      return sendJson(res, geminiResponse.status, {
+        error: 'The image service could not create this image. Please try again.',
+        debug
+      });
     }
 
     const parts = data?.candidates?.[0]?.content?.parts || [];
-    const imagePart = parts.find(part => part.inline_data || part.inlineData);
+    // Gemini 3 image models can return intermediate thought images. The final
+    // non-thought image is the user-facing result.
+    const generatedImages = parts.map(getInlineImage).filter(Boolean);
+    const generatedImage = generatedImages.at(-1);
 
-    if (!imagePart) {
-      return sendJson(res, 502, { error: 'No image was returned. Please try another photo or style.' });
+    if (!generatedImage || !isValidBase64(generatedImage.data)) {
+      console.error('Gemini returned no usable final image.', {
+        requestId,
+        finishReason: data?.candidates?.[0]?.finishReason || null,
+        candidateCount: data?.candidates?.length || 0,
+        partCount: parts.length
+      });
+      return sendJson(res, 502, {
+        error: 'No finished image was returned. Please try another photo or style.',
+        debug
+      });
     }
 
-    const inline = imagePart.inline_data || imagePart.inlineData;
+    if (generatedImage.data === normalizedImage) {
+      console.error('Gemini returned the input image unchanged.', { requestId, styleId: normalizedStyleId });
+      return sendJson(res, 502, {
+        error: 'The image was not transformed. Please try again.',
+        debug
+      });
+    }
+
+    debug.outputMimeType = generatedImage.mimeType;
+    debug.outputBytes = Buffer.from(generatedImage.data, 'base64').length;
+    console.info('Artly generation completed.', debug);
+
     return sendJson(res, 200, {
-      image: inline.data,
-      mimeType: inline.mime_type || inline.mimeType || 'image/png'
+      image: generatedImage.data,
+      mimeType: generatedImage.mimeType,
+      debug
     });
   } catch (error) {
-    console.error('Artly generation error:', error);
-    return sendJson(res, 500, { error: 'Something went wrong while creating your image.' });
+    const reason = error?.name === 'TimeoutError' ? 'gemini_timeout' : 'unexpected_error';
+    console.error('Artly generation error.', { requestId, reason });
+    return sendJson(res, 500, {
+      error: reason === 'gemini_timeout'
+        ? 'Image creation took too long. Please try again.'
+        : 'Something went wrong while creating your image.',
+      debug: { requestId, model: GEMINI_MODEL }
+    });
   }
 };

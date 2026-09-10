@@ -11,7 +11,7 @@ I kept the scope deliberately narrow: choose a style, provide a photo, get a res
 ## How it works
 
 1. You pick one of twelve art styles from the gallery.
-2. You add a photo, either by uploading a file (JPG, PNG, or WebP) or capturing one with your camera.
+2. You add a photo under 3 MB, either by uploading a file (JPG, PNG, or WebP) or capturing one with your camera.
 3. The browser sends the style ID, the photo as base64, and its MIME type to `/api/generate`.
 4. The serverless function looks up the matching prompt, calls the Gemini image model with the prompt and your photo, and returns the generated image.
 5. The result appears in the page, and you can download it or try another style with the same photo.
@@ -37,7 +37,7 @@ The interface is a single vertical flow — hero, style gallery, photo input, an
 
 - **Front end:** HTML, CSS, and vanilla JavaScript (no framework, no bundler).
 - **Back end:** a single Node.js serverless function (`api/generate.js`).
-- **Image generation:** Google Gemini (`gemini-2.5-flash-image`) via the Generative Language API.
+- **Image generation:** Google Gemini (`gemini-3.1-flash-image`) via the Generative Language API.
 - **Hosting/config:** Vercel (`vercel.json`).
 - **Tooling:** a Python standard-library script for project validation.
 
